@@ -48,7 +48,11 @@ class Tables(sqlContext: SQLContext, scaleFactor: Int) extends Serializable {
      *  converted to `schema`. Otherwise, it just outputs the raw data (as a single STRING column).
      */
     def df(convertToSchema: Boolean, numPartition: Int): DataFrame = {
-      val partitions = if (partitionColumns.isEmpty) 1 else numPartition
+      val numDefaultPartitions = sparkContext
+        .conf
+        .getInt("tpcds.gen.defaultParallel", defaultValue = 1000)
+
+      val partitions = if (partitionColumns.isEmpty) numDefaultPartitions else numPartition
       val generatedData = {
         sparkContext.parallelize(1 to partitions, partitions).flatMap { i =>
           val datagen = DsdgenNative()
@@ -62,10 +66,9 @@ class Tables(sqlContext: SQLContext, scaleFactor: Int) extends Serializable {
           commands.lines
         }
       }
-
       generatedData.setName(s"$name, sf=$scaleFactor, strings")
 
-      val rows = generatedData.mapPartitions { iter =>
+      var rows = generatedData.mapPartitions { iter =>
         iter.map { l =>
           if (convertToSchema) {
             val values = l.split("\\|", -1).dropRight(1).map { v =>
@@ -172,8 +175,18 @@ class Tables(sqlContext: SQLContext, scaleFactor: Int) extends Serializable {
           data.write
         }
       } else {
-        // If the table is not partitioned, coalesce the data to a single file.
-        data.coalesce(1).write
+        // If the table is not partitioned, repartition the data into file with estimated target size.
+        val cached = data.cache()
+        val plainDataSize = cached
+          .mapPartitions { iter =>
+            Iterator.single(iter.map(_.mkString("\t").length).sum.toLong)
+          }
+          .collect()
+          .sum
+
+        // 4 GB plain data per file
+        val numTargetFiles = math.max(1, math.ceil(plainDataSize / 4 / 1024.0 / 1024.0 / 1024.0).toInt)
+        cached.repartition(numTargetFiles).write
       }
       writer.format(format).mode(mode)
       if (partitionColumns.nonEmpty) {
